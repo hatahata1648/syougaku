@@ -1,526 +1,602 @@
-let webcamStream = null;
-let isFullscreen = false;
-let poseDetector = null;
-let animationId = null;
-let bubbleVideos = [];
-let bubbleInterval = null;
-
-const webcamVideo = document.getElementById('webcam');
-const overlayVideo = document.getElementById('overlay');
-const container = document.getElementById('container');
-const fullscreenHint = document.getElementById('fullscreenHint');
-const poseCanvas = document.getElementById('poseCanvas');
-const debugInfo = document.getElementById('debugInfo');
-const ctx = poseCanvas.getContext('2d');
-
-// ライブラリの読み込み待ち
-function waitForLibraries() {
-    return new Promise((resolve) => {
-        const checkLibraries = () => {
-            if (typeof tf !== 'undefined' && typeof poseDetection !== 'undefined') {
-                resolve();
-            } else {
-                setTimeout(checkLibraries, 100);
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ウェブカメラ アクション検出アプリ</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            font-family: Arial, sans-serif;
+            color: white;
+            overflow: hidden;
+        }
+        
+        .container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+            cursor: pointer;
+        }
+        
+        .fullscreen-hint {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            z-index: 1000;
+            font-size: 18px;
+            display: none;
+        }
+        
+        .video-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        
+        #webcam {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+            background-color: #000;
+        }
+        
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            pointer-events: none;
+            opacity: 0.8;
+            filter: contrast(1.2) brightness(1.1);
+            mix-blend-mode: screen;
+        }
+        
+        .bubble-video {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            opacity: 0.7;
+            pointer-events: none;
+            z-index: 200;
+            transition: none;
+            mix-blend-mode: screen;
+        }
+        
+        @keyframes bubbleFloat {
+            0% {
+                transform: translateY(0) scale(0.5);
+                opacity: 0;
             }
-        };
-        checkLibraries();
-    });
-}
+            10% {
+                opacity: 0.7;
+                transform: translateY(-20px) scale(1);
+            }
+            90% {
+                opacity: 0.7;
+                transform: translateY(-100vh) scale(1.2);
+            }
+            100% {
+                transform: translateY(-100vh) scale(0.8);
+                opacity: 0;
+            }
+        }
+        
+        .bubble-video.animate {
+            animation: bubbleFloat 12s ease-out forwards;
+        }
+        
+        .effect-video {
+            position: absolute;
+            width: 200px;
+            height: 200px;
+            border-radius: 10px;
+            opacity: 0.8;
+            pointer-events: none;
+            z-index: 300;
+            mix-blend-mode: screen;
+        }
+        
+        .debug-info {
+            display: none;
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            z-index: 500;
+        }
+        
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 50;
+        }
+    </style>
+</head>
+<body>
+    <div class="container" id="container">
+        <div class="fullscreen-hint" id="fullscreenHint">
+            画面をクリックして全画面表示にしてください
+        </div>
+        <div class="video-container" id="videoContainer">
+            <video id="webcam" autoplay muted playsinline>
+                お使いのブラウザはwebcamをサポートしていません。
+            </video>
+            <video id="overlay" loop muted playsinline>
+                <source src="video.mp4" type="video/mp4">
+            </video>
+            <canvas id="poseCanvas"></canvas>
+        </div>
+        <div class="debug-info" id="debugInfo">
+            初期化中...
+        </div>
+    </div>
 
-// ページ読み込み時に初期化
-window.addEventListener('load', async () => {
-    debugInfo.textContent = 'ライブラリ読み込み中...';
+    <!-- TensorFlow.jsライブラリを段階的に読み込み -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.0.0/dist/pose-detection.min.js"></script>
     
-    // ブラウザがWebRTCをサポートしているかチェック
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        debugInfo.textContent = 'このブラウザはWebRTCをサポートしていません';
-        return;
-    }
+    <script>
+        let webcamStream = null;
+        let isFullscreen = false;
+        let poseDetector = null;
+        let animationId = null;
+        let bubbleVideos = [];
+        let effectVideos = [];
+        let aiEnabled = false;
+        let lastPersonTime = 0;
+        const PERSON_COOLDOWN = 3000; // 3秒のクールダウン
+        
+        const webcamVideo = document.getElementById('webcam');
+        const overlayVideo = document.getElementById('overlay');
+        const container = document.getElementById('container');
+        const fullscreenHint = document.getElementById('fullscreenHint');
+        const poseCanvas = document.getElementById('poseCanvas');
+        const debugInfo = document.getElementById('debugInfo');
+        const ctx = poseCanvas.getContext('2d');
 
-    try {
-        await waitForLibraries();
-        debugInfo.textContent = 'AI モデル初期化中...';
-        await initializePoseDetection();
-        await startWebcam();
-        startPoseDetection();
-        startBubbleEffect();
-        
-        setTimeout(() => {
-            if (!isFullscreen) {
-                fullscreenHint.style.display = 'block';
-            }
-        }, 2000);
-    } catch (error) {
-        console.error('初期化エラー:', error);
-        debugInfo.textContent = `初期化エラー: ${error.message}`;
-    }
-});
-
-// コンテナクリックでフルスクリーン
-container.addEventListener('click', () => {
-    if (!isFullscreen) {
-        enterFullscreen();
-    }
-});
-
-async function initializePoseDetection() {
-    try {
-        debugInfo.textContent = 'AI モデル読み込み中...';
-        
-        // TensorFlowが利用可能か確認
-        if (typeof tf === 'undefined' || typeof poseDetection === 'undefined') {
-            throw new Error('TensorFlow.jsまたはPose Detectionライブラリが読み込まれていません');
-        }
-
-        // BlazePoseモデルを読み込み
-        const detectorConfig = {
-            runtime: 'tfjs',
-            enableSmoothing: true,
-            modelType: 'lite'
-        };
-        
-        poseDetector = await poseDetection.createDetector(
-            poseDetection.SupportedModels.BlazePose, 
-            detectorConfig
-        );
-        
-        debugInfo.textContent = 'AI モデル読み込み完了';
-    } catch (error) {
-        console.error('ポーズ検出の初期化に失敗:', error);
-        debugInfo.textContent = `AI モデルエラー: ${error.message}`;
-        // AI機能なしでも動作するように続行
-    }
-}
-
-async function startWebcam() {
-    try {
-        debugInfo.textContent = 'カメラ起動中...';
-        
-        // まず利用可能なデバイスを確認
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const videoDevices = devices.filter(device => device.kind === 'videoinput');
-        
-        if (videoDevices.length === 0) {
-            throw new Error('カメラデバイスが見つかりません');
-        }
-
-        // ウェブカメラの制約を設定
-        const constraints = {
-            video: {
-                width: { ideal: 1280, max: 1920 },
-                height: { ideal: 720, max: 1080 },
-                frameRate: { ideal: 30, max: 30 },
-                facingMode: 'user'
-            },
-            audio: false
-        };
-
-        // ウェブカメラストリームを取得
-        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
-        
-        // 動画要素にストリームを設定
-        webcamVideo.srcObject = webcamStream;
-        
-        // 動画の読み込みを待つ
-        await new Promise((resolve, reject) => {
-            webcamVideo.onloadedmetadata = () => {
-                webcamVideo.play()
-                    .then(() => {
-                        // キャンバスサイズを動画に合わせて調整
-                        poseCanvas.width = webcamVideo.videoWidth;
-                        poseCanvas.height = webcamVideo.videoHeight;
-                        resolve();
-                    })
-                    .catch(reject);
-            };
-            webcamVideo.onerror = reject;
-        });
-        
-        debugInfo.textContent = `カメラ起動完了 (${webcamVideo.videoWidth}x${webcamVideo.videoHeight})`;
-        
-        // オーバーレイ動画を読み込み・再生
-        overlayVideo.load();
-        overlayVideo.play().catch(error => {
-            console.log('オーバーレイ動画の自動再生に失敗:', error);
-        });
-        
-    } catch (error) {
-        console.error('ウェブカメラの開始に失敗:', error);
-        debugInfo.textContent = `カメラエラー: ${error.message}`;
-        
-        // フォールバック: より低い解像度で再試行
-        try {
-            debugInfo.textContent = '低解像度で再試行中...';
-            const fallbackConstraints = {
-                video: { width: 640, height: 480 },
-                audio: false
-            };
-            
-            webcamStream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
-            webcamVideo.srcObject = webcamStream;
-            
-            await new Promise((resolve, reject) => {
-                webcamVideo.onloadedmetadata = () => {
-                    webcamVideo.play()
-                        .then(() => {
-                            poseCanvas.width = webcamVideo.videoWidth;
-                            poseCanvas.height = webcamVideo.videoHeight;
-                            resolve();
-                        })
-                        .catch(reject);
+        // ライブラリの読み込み待ち関数
+        function waitForLibraries() {
+            return new Promise((resolve) => {
+                let attempts = 0;
+                const maxAttempts = 50; // 5秒間待機
+                
+                const checkLibraries = () => {
+                    attempts++;
+                    if (typeof tf !== 'undefined' && typeof poseDetection !== 'undefined') {
+                        debugInfo.textContent = 'ライブラリ読み込み完了';
+                        resolve(true);
+                    } else if (attempts >= maxAttempts) {
+                        debugInfo.textContent = 'AI機能なしで動作';
+                        resolve(false);
+                    } else {
+                        setTimeout(checkLibraries, 100);
+                    }
                 };
-                webcamVideo.onerror = reject;
+                checkLibraries();
             });
-            
-            debugInfo.textContent = `カメラ起動完了 (低解像度: ${webcamVideo.videoWidth}x${webcamVideo.videoHeight})`;
-            
-        } catch (fallbackError) {
-            console.error('フォールバックも失敗:', fallbackError);
-            debugInfo.textContent = 'カメラの起動に失敗しました。';
         }
-    }
-}
 
-async function startPoseDetection() {
-    if (!poseDetector) {
-        debugInfo.textContent = 'AI機能なしで動作中';
-        return;
-    }
-    
-    const detectPose = async () => {
-        try {
-            if (webcamVideo.readyState >= 2 && webcamVideo.videoWidth > 0 && webcamVideo.videoHeight > 0) {
-                const poses = await poseDetector.estimatePoses(webcamVideo);
+        // ページ読み込み時に初期化
+        window.addEventListener('load', async () => {
+            debugInfo.textContent = 'ライブラリ確認中...';
+            
+            // ブラウザサポート確認
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                debugInfo.textContent = 'このブラウザはWebRTCをサポートしていません';
+                return;
+            }
+
+            try {
+                // ライブラリの読み込み待ち
+                aiEnabled = await waitForLibraries();
                 
-                // キャンバスをクリア
-                ctx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+                if (aiEnabled) {
+                    await initializePoseDetection();
+                }
                 
-                if (poses.length > 0) {
-                    const pose = poses[0];
-                    debugInfo.textContent = `人物検出中 (信頼度: ${Math.round(pose.score * 100)}%)`;
-                    drawPose(pose);
-                } else {
-                    debugInfo.textContent = '人物を検出中...';
+                await startWebcam();
+                
+                if (aiEnabled && poseDetector) {
+                    startPoseDetection();
+                }
+                
+                startBubbleEffect();
+                
+                setTimeout(() => {
+                    if (!isFullscreen) {
+                        fullscreenHint.style.display = 'block';
+                    }
+                }, 2000);
+                
+            } catch (error) {
+                console.error('初期化エラー:', error);
+                debugInfo.textContent = `エラー: ${error.message}`;
+            }
+        });
+
+        // フルスクリーンクリック
+        container.addEventListener('click', () => {
+            if (!isFullscreen) {
+                enterFullscreen();
+            }
+        });
+
+        async function initializePoseDetection() {
+            if (!aiEnabled) return;
+            
+            try {
+                debugInfo.textContent = 'AI モデル読み込み中...';
+                
+                // TensorFlow.js利用可能性確認
+                if (typeof tf === 'undefined' || typeof poseDetection === 'undefined') {
+                    throw new Error('TensorFlow.jsライブラリが利用できません');
+                }
+
+                // BlazePoseモデル読み込み
+                const detectorConfig = {
+                    runtime: 'tfjs',
+                    enableSmoothing: true,
+                    modelType: 'lite'
+                };
+                
+                poseDetector = await poseDetection.createDetector(
+                    poseDetection.SupportedModels.BlazePose, 
+                    detectorConfig
+                );
+                
+                debugInfo.textContent = 'AI モデル読み込み完了';
+                
+            } catch (error) {
+                console.error('ポーズ検出初期化失敗:', error);
+                debugInfo.textContent = 'AI機能を無効化して続行';
+                aiEnabled = false;
+                poseDetector = null;
+            }
+        }
+
+        async function startWebcam() {
+            try {
+                debugInfo.textContent = 'カメラ起動中...';
+                
+                // デバイス確認
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const videoDevices = devices.filter(device => device.kind === 'videoinput');
+                
+                if (videoDevices.length === 0) {
+                    throw new Error('カメラデバイスが見つかりません');
+                }
+
+                // カメラ制約設定
+                const constraints = {
+                    video: {
+                        width: { ideal: 1280, max: 1920 },
+                        height: { ideal: 720, max: 1080 },
+                        frameRate: { ideal: 30, max: 30 },
+                        facingMode: 'user'
+                    },
+                    audio: false
+                };
+
+                // ストリーム取得
+                webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+                webcamVideo.srcObject = webcamStream;
+                
+                // 動画読み込み待ち
+                await new Promise((resolve, reject) => {
+                    webcamVideo.onloadedmetadata = () => {
+                        webcamVideo.play()
+                            .then(() => {
+                                // キャンバスサイズ調整
+                                poseCanvas.width = webcamVideo.videoWidth;
+                                poseCanvas.height = webcamVideo.videoHeight;
+                                resolve();
+                            })
+                            .catch(reject);
+                    };
+                    webcamVideo.onerror = reject;
+                });
+                
+                debugInfo.textContent = `カメラ起動完了 (${webcamVideo.videoWidth}x${webcamVideo.videoHeight})`;
+                
+                // オーバーレイ動画読み込み
+                overlayVideo.load();
+                overlayVideo.play().catch(error => {
+                    console.log('オーバーレイ動画自動再生失敗:', error);
+                });
+                
+            } catch (error) {
+                console.error('カメラ起動失敗:', error);
+                debugInfo.textContent = `カメラエラー: ${error.message}`;
+                
+                // 低解像度フォールバック
+                try {
+                    debugInfo.textContent = '低解像度で再試行中...';
+                    const fallbackConstraints = {
+                        video: { width: 640, height: 480 },
+                        audio: false
+                    };
+                    
+                    webcamStream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
+                    webcamVideo.srcObject = webcamStream;
+                    
+                    await new Promise((resolve, reject) => {
+                        webcamVideo.onloadedmetadata = () => {
+                            webcamVideo.play()
+                                .then(() => {
+                                    poseCanvas.width = webcamVideo.videoWidth;
+                                    poseCanvas.height = webcamVideo.videoHeight;
+                                    resolve();
+                                })
+                                .catch(reject);
+                        };
+                        webcamVideo.onerror = reject;
+                    });
+                    
+                    debugInfo.textContent = `カメラ起動完了 (低解像度: ${webcamVideo.videoWidth}x${webcamVideo.videoHeight})`;
+                    
+                } catch (fallbackError) {
+                    console.error('フォールバック失敗:', fallbackError);
+                    debugInfo.textContent = 'カメラの起動に失敗';
                 }
             }
-        } catch (error) {
-            console.error('ポーズ検出エラー:', error);
         }
-        
-        animationId = requestAnimationFrame(detectPose);
-    };
-    
-    detectPose();
-}
 
-function drawPose(pose) {
-    const keypoints = pose.keypoints;
-    
-    // 関節を描画
-    keypoints.forEach(keypoint => {
-        if (keypoint.score > 0.5) {
-            const x = keypoint.x * (poseCanvas.width / webcamVideo.videoWidth);
-            const y = keypoint.y * (poseCanvas.height / webcamVideo.videoHeight);
+        async function startPoseDetection() {
+            if (!aiEnabled || !poseDetector) {
+                return;
+            }
             
-            ctx.fillStyle = '#ff0000';
-            ctx.beginPath();
-            ctx.arc(x, y, 3, 0, 2 * Math.PI);
-            ctx.fill();
-        }
-    });
-}
-
-function startBubbleEffect() {
-    const generateBubble = () => {
-        createBubble();
-        const nextBubbleTime = Math.random() * 1150 + 750;
-        setTimeout(generateBubble, nextBubbleTime);
-    };
-    
-    for (let i = 0; i < 2; i++) {
-        setTimeout(generateBubble, i * 500);
-    }
-}
-
-function createBubble() {
-    const bubbleVideo = document.createElement('video');
-    bubbleVideo.className = 'bubble-video';
-    bubbleVideo.loop = true;
-    bubbleVideo.muted = true;
-    bubbleVideo.autoplay = true;
-    bubbleVideo.playsInline = true;
-    bubbleVideo.src = 'bub.mp4';
-    
-    const randomX = Math.random() * (window.innerWidth - 100);
-    const startY = window.innerHeight + 20;
-    
-    bubbleVideo.style.left = randomX + 'px';
-    bubbleVideo.style.top = startY + 'px';
-    
-    const randomSize = Math.random() * 40 + 80;
-    bubbleVideo.style.width = randomSize + 'px';
-    bubbleVideo.style.height = randomSize + 'px';
-    
-    const randomOpacity = Math.random() * 0.3 + 0.4;
-    bubbleVideo.style.opacity = randomOpacity;
-    
-    container.appendChild(bubbleVideo);
-    bubbleVideos.push(bubbleVideo);
-    
-    setTimeout(() => {
-        bubbleVideo.classList.add('animate');
-    }, 100);
-    
-    bubbleVideo.play().catch(error => {
-        console.log('泡動画の再生に失敗:', error);
-    });
-    
-    setTimeout(() => {
-        if (bubbleVideo.parentNode) {
-            bubbleVideo.parentNode.removeChild(bubbleVideo);
-        }
-        const index = bubbleVideos.indexOf(bubbleVideo);
-        if (index > -1) {
-            bubbleVideos.splice(index, 1);
-        }
-    }, 12500);
-}
-
-function enterFullscreen() {
-    const element = document.documentElement;
-    if (element.requestFullscreen) {
-        element.requestFullscreen();
-    } else if (element.webkitRequestFullscreen) {
-        element.webkitRequestFullscreen();
-    } else if (element.msRequestFullscreen) {
-        element.msRequestFullscreen();
-    }
-}
-
-// フルスクリーン状態の変更を監視
-document.addEventListener('fullscreenchange', () => {
-    isFullscreen = !!document.fullscreenElement;
-    if (isFullscreen) {
-        fullscreenHint.style.display = 'none';
-    }
-});
-
-document.addEventListener('webkitfullscreenchange', () => {
-    isFullscreen = !!document.webkitFullscreenElement;
-    if (isFullscreen) {
-        fullscreenHint.style.display = 'none';
-    }
-});
-
-// オーバーレイ動画の読み込み完了時
-overlayVideo.addEventListener('loadeddata', () => {
-    console.log('オーバーレイ動画が読み込まれました');
-});
-
-// ページ終了時にリソースを解放
-window.addEventListener('beforeunload', () => {
-    if (animationId) {
-        cancelAnimationFrame(animationId);
-    }
-    if (webcamStream) {
-        webcamStream.getTracks().forEach(track => track.stop());
-    }
-});
-    const rightWrist = keypoints.find(kp => kp.name === 'right_wrist');
-    const leftShoulder = keypoints.find(kp => kp.name === 'left_shoulder');
-    const rightShoulder = keypoints.find(kp => kp.name === 'right_shoulder');
-    const nose = keypoints.find(kp => kp.name === 'nose');
-    
-    // 両手を上げるアクション
-    if (leftWrist && rightWrist && leftShoulder && rightShoulder && nose) {
-        if (leftWrist.score > 0.5 && rightWrist.score > 0.5 && 
-            leftShoulder.score > 0.5 && rightShoulder.score > 0.5 && nose.score > 0.5) {
-            
-            const leftHandUp = leftWrist.y < leftShoulder.y;
-            const rightHandUp = rightWrist.y < rightShoulder.y;
-            
-            if (leftHandUp && rightHandUp) {
-                // 両手を上げた！
-                const centerX = (leftWrist.x + rightWrist.x) / 2;
-                const centerY = Math.min(leftWrist.y, rightWrist.y);
+            const detectPose = async () => {
+                try {
+                    if (webcamVideo.readyState >= 2 && webcamVideo.videoWidth > 0) {
+                        const poses = await poseDetector.estimatePoses(webcamVideo);
+                        
+                        // キャンバスクリア
+                        ctx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+                        
+                        if (poses.length > 0) {
+                            const pose = poses[0];
+                            debugInfo.textContent = `人物検出中 (信頼度: ${Math.round(pose.score * 100)}%)`;
+                            drawPose(pose);
+                            checkForPerson(pose); // 人物検出時のエフェクト追加
+                        } else {
+                            debugInfo.textContent = '人物を検出中...';
+                        }
+                    }
+                } catch (error) {
+                    console.error('ポーズ検出エラー:', error);
+                }
                 
-                triggerActionVideo(centerX, centerY, 'hands_up');
-                lastActionTime = currentTime;
-            }
-        }
-    }
-    
-    // 手を振るアクション（右手）
-    if (rightWrist && rightShoulder && nose) {
-        if (rightWrist.score > 0.5 && rightShoulder.score > 0.5 && nose.score > 0.5) {
-            const handUp = rightWrist.y < nose.y;
-            const handRight = rightWrist.x > rightShoulder.x + 50;
+                animationId = requestAnimationFrame(detectPose);
+            };
             
-            if (handUp && handRight) {
-                triggerActionVideo(rightWrist.x, rightWrist.y, 'wave');
-                lastActionTime = currentTime;
+            detectPose();
+        }
+
+        function drawPose(pose) {
+            const keypoints = pose.keypoints;
+            
+            // 関節描画
+            keypoints.forEach(keypoint => {
+                if (keypoint.score > 0.5) {
+                    const x = keypoint.x * (poseCanvas.width / webcamVideo.videoWidth);
+                    const y = keypoint.y * (poseCanvas.height / webcamVideo.videoHeight);
+                    
+                    ctx.fillStyle = '#ff0000';
+                    ctx.beginPath();
+                    ctx.arc(x, y, 3, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+            });
+        }
+
+        function checkForPerson(pose) {
+            const currentTime = Date.now();
+            if (currentTime - lastPersonTime < PERSON_COOLDOWN) return;
+
+            // 人物の信頼度が十分高い場合
+            if (pose.score > 0.3) {
+                // 人物の中心位置を計算
+                const keypoints = pose.keypoints;
+                const nose = keypoints.find(kp => kp.name === 'nose');
+                const leftShoulder = keypoints.find(kp => kp.name === 'left_shoulder');
+                const rightShoulder = keypoints.find(kp => kp.name === 'right_shoulder');
+                
+                let centerX, centerY;
+                
+                if (nose && nose.score > 0.5) {
+                    // 鼻の位置を中心として使用
+                    centerX = nose.x;
+                    centerY = nose.y;
+                } else if (leftShoulder && rightShoulder && leftShoulder.score > 0.3 && rightShoulder.score > 0.3) {
+                    // 両肩の中点を使用
+                    centerX = (leftShoulder.x + rightShoulder.x) / 2;
+                    centerY = (leftShoulder.y + rightShoulder.y) / 2;
+                } else {
+                    // 検出された全キーポイントの重心を使用
+                    const validKeypoints = keypoints.filter(kp => kp.score > 0.3);
+                    if (validKeypoints.length > 0) {
+                        centerX = validKeypoints.reduce((sum, kp) => sum + kp.x, 0) / validKeypoints.length;
+                        centerY = validKeypoints.reduce((sum, kp) => sum + kp.y, 0) / validKeypoints.length;
+                    } else {
+                        return; // 有効なキーポイントがない場合は終了
+                    }
+                }
+                
+                triggerPersonEffect(centerX, centerY);
+                lastPersonTime = currentTime;
             }
         }
-    }
-    */
-}
 
-function triggerActionVideo(x, y, actionType) {
-    // 画面座標に変換
-    const screenX = (x / webcamVideo.videoWidth) * window.innerWidth;
-    const screenY = (y / webcamVideo.videoHeight) * window.innerHeight;
-    
-    // アクション動画を作成
-    const actionVideo = document.createElement('video');
-    actionVideo.className = 'action-video';
-    actionVideo.loop = true;
-    actionVideo.muted = true;
-    actionVideo.autoplay = true;
-    actionVideo.playsInline = true;
-    
-    // アクションタイプに応じて動画を設定
-    if (actionType === 'hands_up') {
-        actionVideo.src = 'celebration.mp4'; // 祝福動画
-    } else if (actionType === 'wave') {
-        actionVideo.src = 'wave_effect.mp4'; // 手を振る効果動画
-    }
-    
-    // 位置を設定
-    actionVideo.style.left = Math.max(0, Math.min(screenX - 100, window.innerWidth - 200)) + 'px';
-    actionVideo.style.top = Math.max(0, Math.min(screenY - 75, window.innerHeight - 150)) + 'px';
-    
-    container.appendChild(actionVideo);
-    actionVideos.push(actionVideo);
-    
-    // 再生開始
-    actionVideo.play().catch(error => {
-        console.log('アクション動画の再生に失敗:', error);
-    });
-    
-    // 5秒後に削除
-    setTimeout(() => {
-        if (actionVideo.parentNode) {
-            actionVideo.parentNode.removeChild(actionVideo);
+        function triggerPersonEffect(x, y) {
+            // ポーズ座標を画面座標に変換
+            const screenX = (x / webcamVideo.videoWidth) * window.innerWidth;
+            const screenY = (y / webcamVideo.videoHeight) * window.innerHeight;
+            
+            // エフェクト動画を作成
+            const effectVideo = document.createElement('video');
+            effectVideo.className = 'effect-video';
+            effectVideo.muted = true;
+            effectVideo.autoplay = true;
+            effectVideo.playsInline = true;
+            effectVideo.src = 'effect.mp4';
+            
+            // 人物の中心位置に配置（中央揃え）
+            effectVideo.style.left = Math.max(0, Math.min(screenX - 100, window.innerWidth - 200)) + 'px';
+            effectVideo.style.top = Math.max(0, Math.min(screenY - 100, window.innerHeight - 200)) + 'px';
+            
+            // 画面に追加
+            container.appendChild(effectVideo);
+            effectVideos.push(effectVideo);
+            
+            // 再生開始
+            effectVideo.play().catch(error => {
+                console.log('エフェクト動画の再生に失敗:', error);
+            });
+            
+            // 4秒後に削除
+            setTimeout(() => {
+                if (effectVideo.parentNode) {
+                    effectVideo.parentNode.removeChild(effectVideo);
+                }
+                const index = effectVideos.indexOf(effectVideo);
+                if (index > -1) {
+                    effectVideos.splice(index, 1);
+                }
+            }, 4000);
+            
+            console.log(`人物検出エフェクト: effect.mp4 at (${Math.round(screenX)}, ${Math.round(screenY)})`);
         }
-        const index = actionVideos.indexOf(actionVideo);
-        if (index > -1) {
-            actionVideos.splice(index, 1);
+
+        function startBubbleEffect() {
+            const generateBubble = () => {
+                createBubble();
+                const nextBubbleTime = Math.random() * 1150 + 750; // 0.75-1.9秒
+                setTimeout(generateBubble, nextBubbleTime);
+            };
+            
+            // 2つの泡生成チェーン
+            for (let i = 0; i < 2; i++) {
+                setTimeout(generateBubble, i * 500);
+            }
         }
-    }, 5000);
-    
-    console.log(`アクション検出: ${actionType} at (${screenX}, ${screenY})`);
-}
 
-function startBubbleEffect() {
-    // 泡を定期的に生成 (0.75-1.9秒間隔でランダム) - 2倍に増加
-    const generateBubble = () => {
-        createBubble();
-        
-        // 次の泡生成までの時間をランダムに設定
-        const nextBubbleTime = Math.random() * 1150 + 750; // 0.75-1.9秒
-        setTimeout(generateBubble, nextBubbleTime);
-    };
-    
-    // 2つの泡生成チェーンを開始（1つから2つに増やして2倍に）
-    for (let i = 0; i < 2; i++) {
-        setTimeout(generateBubble, i * 500); // 0.5秒ずつずらして開始
-    }
-}
-
-function createBubble() {
-    // 泡動画を作成
-    const bubbleVideo = document.createElement('video');
-    bubbleVideo.className = 'bubble-video';
-    bubbleVideo.loop = true;
-    bubbleVideo.muted = true;
-    bubbleVideo.autoplay = true;
-    bubbleVideo.playsInline = true;
-    
-    // 泡動画のソースを設定
-    bubbleVideo.src = 'bub.mp4';
-    
-    // ランダムな位置に配置（画面の底部から開始）
-    const randomX = Math.random() * (window.innerWidth - 100); // 100pxは泡のサイズ
-    const startY = window.innerHeight + 20; // 画面下から少し下
-    
-    bubbleVideo.style.left = randomX + 'px';
-    bubbleVideo.style.top = startY + 'px';
-    
-    // ランダムなサイズバリエーション（80-120px）
-    const randomSize = Math.random() * 40 + 80; // 80-120px
-    bubbleVideo.style.width = randomSize + 'px';
-    bubbleVideo.style.height = randomSize + 'px';
-    
-    // ランダムな透明度
-    const randomOpacity = Math.random() * 0.3 + 0.4; // 0.4-0.7
-    bubbleVideo.style.opacity = randomOpacity;
-    
-    // 画面に追加
-    container.appendChild(bubbleVideo);
-    bubbleVideos.push(bubbleVideo);
-    
-    // アニメーション開始
-    setTimeout(() => {
-        bubbleVideo.classList.add('animate');
-    }, 100);
-    
-    // 再生開始
-    bubbleVideo.play().catch(error => {
-        console.log('泡動画の再生に失敗:', error);
-    });
-    
-    // アニメーション完了後に削除（12秒に延長）
-    setTimeout(() => {
-        if (bubbleVideo.parentNode) {
-            bubbleVideo.parentNode.removeChild(bubbleVideo);
+        function createBubble() {
+            const bubbleVideo = document.createElement('video');
+            bubbleVideo.className = 'bubble-video';
+            bubbleVideo.loop = true;
+            bubbleVideo.muted = true;
+            bubbleVideo.autoplay = true;
+            bubbleVideo.playsInline = true;
+            bubbleVideo.src = 'bub.mp4';
+            
+            // ランダム位置
+            const randomX = Math.random() * (window.innerWidth - 100);
+            const startY = window.innerHeight + 20;
+            
+            bubbleVideo.style.left = randomX + 'px';
+            bubbleVideo.style.top = startY + 'px';
+            
+            // ランダムサイズ
+            const randomSize = Math.random() * 40 + 80; // 80-120px
+            bubbleVideo.style.width = randomSize + 'px';
+            bubbleVideo.style.height = randomSize + 'px';
+            
+            // ランダム透明度
+            const randomOpacity = Math.random() * 0.3 + 0.4; // 0.4-0.7
+            bubbleVideo.style.opacity = randomOpacity;
+            
+            container.appendChild(bubbleVideo);
+            bubbleVideos.push(bubbleVideo);
+            
+            // アニメーション開始
+            setTimeout(() => {
+                bubbleVideo.classList.add('animate');
+            }, 100);
+            
+            // 再生開始
+            bubbleVideo.play().catch(error => {
+                console.log('泡動画再生失敗:', error);
+            });
+            
+            // 12.5秒後に削除
+            setTimeout(() => {
+                if (bubbleVideo.parentNode) {
+                    bubbleVideo.parentNode.removeChild(bubbleVideo);
+                }
+                const index = bubbleVideos.indexOf(bubbleVideo);
+                if (index > -1) {
+                    bubbleVideos.splice(index, 1);
+                }
+            }, 12500);
         }
-        const index = bubbleVideos.indexOf(bubbleVideo);
-        if (index > -1) {
-            bubbleVideos.splice(index, 1);
+
+        function enterFullscreen() {
+            const element = document.documentElement;
+            if (element.requestFullscreen) {
+                element.requestFullscreen();
+            } else if (element.webkitRequestFullscreen) {
+                element.webkitRequestFullscreen();
+            } else if (element.msRequestFullscreen) {
+                element.msRequestFullscreen();
+            }
         }
-    }, 12500); // アニメーション時間12秒より少し長く
-}
 
-function enterFullscreen() {
-    const element = document.documentElement;
-    if (element.requestFullscreen) {
-        element.requestFullscreen();
-    } else if (element.webkitRequestFullscreen) {
-        element.webkitRequestFullscreen();
-    } else if (element.msRequestFullscreen) {
-        element.msRequestFullscreen();
-    }
-}
+        // フルスクリーン状態監視
+        document.addEventListener('fullscreenchange', () => {
+            isFullscreen = !!document.fullscreenElement;
+            if (isFullscreen) {
+                fullscreenHint.style.display = 'none';
+            }
+        });
 
-// フルスクリーン状態の変更を監視
-document.addEventListener('fullscreenchange', () => {
-    isFullscreen = !!document.fullscreenElement;
-    if (isFullscreen) {
-        fullscreenHint.style.display = 'none';
-    }
-});
+        document.addEventListener('webkitfullscreenchange', () => {
+            isFullscreen = !!document.webkitFullscreenElement;
+            if (isFullscreen) {
+                fullscreenHint.style.display = 'none';
+            }
+        });
 
-document.addEventListener('webkitfullscreenchange', () => {
-    isFullscreen = !!document.webkitFullscreenElement;
-    if (isFullscreen) {
-        fullscreenHint.style.display = 'none';
-    }
-});
+        // オーバーレイ動画読み込み完了
+        overlayVideo.addEventListener('loadeddata', () => {
+            console.log('オーバーレイ動画読み込み完了');
+        });
 
-// オーバーレイ動画の読み込み完了時
-overlayVideo.addEventListener('loadeddata', () => {
-    console.log('オーバーレイ動画が読み込まれました');
-});
-
-// ページ終了時にリソースを解放
-window.addEventListener('beforeunload', () => {
-    if (animationId) {
-        cancelAnimationFrame(animationId);
-    }
-    if (bubbleInterval) {
-        clearInterval(bubbleInterval);
-    }
-    if (webcamStream) {
-        webcamStream.getTracks().forEach(track => track.stop());
-    }
-});
+        // リソース解放
+        window.addEventListener('beforeunload', () => {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            if (webcamStream) {
+                webcamStream.getTracks().forEach(track => track.stop());
+            }
+            // エフェクト動画も停止
+            effectVideos.forEach(video => {
+                if (video.parentNode) {
+                    video.parentNode.removeChild(video);
+                }
+            });
+        });
+    </script>
+</body>
+</html>
